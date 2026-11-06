@@ -1,0 +1,11 @@
+{
+  "navigationStyle": "custom",
+  "backgroundColor": "#F8FAFC",
+  "enablePullDownRefresh": true,
+  "backgroundTextStyle": "dark",
+  "usingComponents": {
+    "tab-bar": "../../components/TabBar",
+    "nav-bar": "../../components/NavBar",
+    "app-dialog": "../../components/AppDialog"
+  }
+}
