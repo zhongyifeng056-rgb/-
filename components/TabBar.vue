@@ -8,7 +8,7 @@
         :key="item.path"
         @click="switchTab(item.path)"
       >
-        <view class="tab-icon-wrap" :class="{ 'on': current === item.path }">
+        <view class="tab-icon-wrap" :class="{ 'on': current === item.path, 'just-activated': activatedPath === item.path }">
           <image class="tab-img" :src="current === item.path ? item.iconOn : item.icon" mode="aspectFit" />
         </view>
         <text class="tab-text">{{ item.text }}</text>
@@ -28,6 +28,7 @@ export default {
 
   data() {
     return {
+      activatedPath: '',
       tabList: [
         { path: 'index', text: '首页', icon: '/static/icons/tab-index.png', iconOn: '/static/icons/tab-index-on.png' },
         { path: 'recognize', text: '识别', icon: '/static/icons/tab-recognize.png', iconOn: '/static/icons/tab-recognize-on.png' },
@@ -48,23 +49,27 @@ export default {
   methods: {
     switchTab(path) {
       if (path === this.current) return
+      this.activatedPath = path
+      // 给选中态一次短促反馈，再进入目标页面
+      setTimeout(() => {
       // 使用 reLaunch 关闭所有页面后打开目标页，模拟原生 tab 切换
       uni.reLaunch({
         url: `/pages/${path}/${path}`
       })
+      }, 110)
     }
   }
 }
 </script>
 
 <style scoped>
-/* 悬浮胶囊式导航：比贴底的白色长条更有层次 */
+/* 贴底轻量导航 */
 .tabbar-wrap {
   position: fixed;
   left: 0;
   right: 0;
   bottom: 0;
-  padding: 0 20rpx calc(16rpx + env(safe-area-inset-bottom));
+  padding: 0 20rpx env(safe-area-inset-bottom);
   z-index: 9999;
   pointer-events: none;
 }
@@ -73,12 +78,11 @@ export default {
   display: flex;
   align-items: center;
   justify-content: space-around;
-  height: 116rpx;
-  background: rgba(255, 255, 255, 0.96);
-  backdrop-filter: blur(20rpx);
-  border-radius: 36rpx;
-  box-shadow: 0 8rpx 36rpx rgba(15, 23, 42, 0.12);
-  border: 1rpx solid rgba(255, 255, 255, 0.8);
+  height: 104rpx;
+  background: rgba(255, 255, 255, 0.98);
+  border-radius: 22rpx 22rpx 0 0;
+  box-shadow: 0 -4rpx 18rpx rgba(30, 55, 45, 0.06);
+  border-top: 1rpx solid #edf0ec;
   pointer-events: auto;
 }
 
@@ -98,18 +102,16 @@ export default {
   align-items: center;
   justify-content: center;
   border-radius: 18rpx;
-  transition: all 0.22s ease;
+  transition: background-color .2s ease, transform .2s ease;
 }
 
-.tab-icon-wrap.on {
-  background: linear-gradient(135deg, #ccfbf1, #99f6e4);
-  box-shadow: 0 4rpx 14rpx rgba(15, 118, 110, 0.25);
-}
+.tab-icon-wrap.on { background: #edf5ee; }
+.tab-icon-wrap.just-activated { animation: tab-tap .28s ease-out; }
 
 .tab-img {
   width: 44rpx;
   height: 44rpx;
-  transition: all 0.22s ease;
+  transition: transform .2s ease, opacity .2s ease;
 }
 
 .tab-icon-wrap.on .tab-img {
@@ -125,8 +127,11 @@ export default {
 
 .tab-item.active .tab-text {
   color: var(--c-primary-deep, #115e59);
-  font-weight: 700;
+  font-weight: 600;
+  animation: tab-label-in .2s ease-out;
 }
+@keyframes tab-tap { 0% { transform: scale(.88); } 65% { transform: scale(1.08); } 100% { transform: scale(1); } }
+@keyframes tab-label-in { from { opacity: .45; transform: translateY(3rpx); } to { opacity: 1; transform: translateY(0); } }
 /* 宽屏：底部导航和内容同宽同位置 */
 @media screen and (min-width: 750px) {
   .tabbar-wrap {

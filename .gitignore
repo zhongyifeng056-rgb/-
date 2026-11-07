@@ -31,3 +31,6 @@ agriculture-backend/logs/
 Thumbs.db
 .idea/
 .vscode/
+
+# 备份文件
+*.bak

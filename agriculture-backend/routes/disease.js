@@ -863,6 +863,8 @@ router.post('/recognize',
           }
         }
         console.log('⚡ 快速识别：' + out.plantName + ' → ' + out.name + ' (' + out.confidence + '%) ' + out.elapsedMs + 'ms')
+        // 让板子把结果念出来（后台进行，不影响响应速度）
+        try { require('../lib/announce').announceResult(out) } catch (e) {}
         return res.json({ code: 200, data: out, message: out.name })
       } catch (e) {
         console.error('快速识别失败，回退完整流程：', e.message)
@@ -1024,6 +1026,7 @@ router.post('/recognize',
       out.historyId = historyId
       out.savedHistory = !!historyId
       out.realtime = skipSave
+      try { require('../lib/announce').announceResult(out) } catch (e) {}
       console.log('✅ 识别完成：' + out.plantName + ' → ' + out.name + ' (' + out.confidence + '%) [' + out.apiSource + ']')
       return res.json({ code: 200, data: out, message: out.plantName ? out.plantName + '：' + out.name : out.name })
     }

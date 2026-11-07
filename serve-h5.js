@@ -55,7 +55,11 @@ const server = http.createServer((req, res) => {
     }
     fs.readFile(file, (e, buf) => {
       if (e) { res.writeHead(404); return res.end('404') }
-      res.writeHead(200, { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream' })
+      res.writeHead(200, {
+        'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
+        // 开发期频繁改前端，禁止缓存，避免浏览器拿着旧 JS 不放
+        'Cache-Control': 'no-cache, no-store, must-revalidate'
+      })
       res.end(buf)
     })
   })

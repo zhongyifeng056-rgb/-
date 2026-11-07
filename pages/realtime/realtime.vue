@@ -180,7 +180,13 @@ export default {
 
     back() {
       this.stop()
-      uni.navigateBack({ fail: () => uni.reLaunch({ url: '/pages/recognize/recognize' }) })
+      // 直接打开这个页面时页面栈只有一层，navigateBack 会静默失败（界面闪一下但不退出）
+      const stack = typeof getCurrentPages === 'function' ? getCurrentPages() : []
+      if (stack.length > 1) {
+        uni.navigateBack({ delta: 1 })
+      } else {
+        uni.reLaunch({ url: '/pages/index/index' })
+      }
     },
 
     toggle() {

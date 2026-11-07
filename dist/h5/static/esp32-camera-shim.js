@@ -4,32 +4,29 @@
  * 把板子（OV2640）的画面伪装成 navigator.mediaDevices.getUserMedia() 返回的
  * 摄像头流，页面里原有的取景/识别逻辑一行都不用改。
  *
- * 数据通路（延迟最优）：
- *   浏览器  --直连-->  ESP32-S3 http://<设备IP>/capture
- * 直连不通时自动退回后端代理 /api/camera/snapshot。
- *
- * 两条线并行：
- *   1. 一张离屏 canvas 持续更新 —— 作为"摄像头流"喂给页面，识别从它取帧
- *   2. 一张可见 canvas 贴在取景框上 —— 保证你能直接看到画面
+ * 稳定性设计：
+ *   1. 设备地址由后端下发（/api/camera/config），换 IP 不用改前端
+ *   2. 连接失败会依次尝试：后端下发 → 上次保存 → 内置默认
+ *   3. 连续取帧失败 5 次自动重连，不会卡死在"连不上"
  */
 (function () {
   'use strict'
 
   var LS_KEY = 'esp32camDevice'
-  var DEFAULT_DEVICE = '10.44.130.135'
-  var STATE = { device: '', ok: false, frames: 0, fps: 0, mode: 'direct', lastError: '' }
+  var DEFAULT_DEVICE = '192.168.10.150'
+  var STATE = { device: '', ok: false, frames: 0, fps: 0, mode: 'direct', fails: 0 }
 
   function qs(name) {
     try { return new URLSearchParams(location.search).get(name) || '' } catch (e) { return '' }
   }
   function readSaved() {
-    try { return localStorage.getItem(LS_KEY) || DEFAULT_DEVICE } catch (e) { return DEFAULT_DEVICE }
+    try { return localStorage.getItem(LS_KEY) || '' } catch (e) { return '' }
   }
   function saveDevice(v) {
     try { localStorage.setItem(LS_KEY, v) } catch (e) {}
   }
 
-  // ---------------- 后端地址（项目约定：H5 用"当前主机 + 3000 端口"） ----------------
+  // ---------------- 后端接口地址（项目约定：H5 用"当前主机 + 3000 端口"） ----------------
   var _apiBase = ''
   function apiCandidates() {
     var host = location.hostname || 'localhost'
@@ -37,11 +34,12 @@
     return [proto + '//' + host + ':3000/api/camera', location.origin + '/api/camera']
   }
   function resolveApiBase() {
+    if (_apiBase) return Promise.resolve(_apiBase)
     var list = apiCandidates(), i = 0
     function next() {
       if (i >= list.length) return Promise.resolve('')
       var base = list[i++]
-      return fetch(base + '/status', { cache: 'no-store' })
+      return fetch(base + '/config', { cache: 'no-store' })
         .then(function (r) { return r.json() })
         .then(function (j) {
           if (j && j.data !== undefined) { _apiBase = base; return base }
@@ -62,7 +60,7 @@
       'position:fixed', 'right:12px', 'top:12px', 'z-index:2147483647',
       'background:rgba(12,26,22,.92)', 'color:#e8fff4', 'border:1px solid rgba(56,193,114,.5)',
       'border-radius:10px', 'padding:8px 10px', 'font:12px/1.5 system-ui,-apple-system,sans-serif',
-      'box-shadow:0 6px 20px rgba(0,0,0,.35)', 'max-width:290px'
+      'box-shadow:0 6px 20px rgba(0,0,0,.35)', 'max-width:300px'
     ].join(';')
     panel.innerHTML =
       '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">' +
@@ -74,6 +72,7 @@
         '<div style="display:flex;gap:6px">' +
           '<input id="esp-ip" placeholder="192.168.1.50" style="flex:1;min-width:0;background:#0a1714;border:1px solid rgba(56,193,114,.4);color:#e8fff4;border-radius:6px;padding:4px 6px;font-size:12px" />' +
           '<button id="esp-go" style="background:#38c172;border:0;color:#04140c;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer">连接</button>' +
+          '<button id="esp-auto" style="background:transparent;border:1px solid rgba(56,193,114,.4);color:#9fe8c4;border-radius:6px;padding:4px 8px;font-size:12px;cursor:pointer">自动</button>' +
         '</div>' +
         '<div id="esp-msg" style="margin-top:5px;opacity:.75;font-size:11px;line-height:1.4">未连接</div>' +
       '</div>'
@@ -82,6 +81,7 @@
     input.value = STATE.device || ''
     input.addEventListener('keydown', function (e) { if (e.key === 'Enter') connect(input.value) })
     panel.querySelector('#esp-go').addEventListener('click', function () { connect(input.value) })
+    panel.querySelector('#esp-auto').addEventListener('click', function () { autoConnect(true) })
     panel.querySelector('#esp-min').addEventListener('click', function () {
       var b = panel.querySelector('#esp-body')
       b.style.display = b.style.display === 'none' ? 'block' : 'none'
@@ -100,6 +100,15 @@
 
   // ---------------- 画布 ----------------
   var canvas = null, ctx = null, overlay = null
+  function drawPlaceholder(msg) {
+    if (!ctx) return
+    ctx.fillStyle = '#0b1220'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    ctx.fillStyle = '#9fe8c4'
+    ctx.font = '22px system-ui, sans-serif'
+    ctx.textAlign = 'center'
+    ctx.fillText(msg, canvas.width / 2, canvas.height / 2 + 8)
+  }
 
   function ensureCanvas() {
     if (canvas) return canvas
@@ -109,9 +118,9 @@
     ctx = canvas.getContext('2d')
     ctx.fillStyle = '#0b1220'
     ctx.fillRect(0, 0, canvas.width, canvas.height)
+    drawPlaceholder('正在连接摄像头…')
     return canvas
   }
-
   function ensureOverlay() {
     if (overlay && document.body.contains(overlay)) return overlay
     var stage = document.querySelector('.stage')
@@ -122,21 +131,37 @@
     overlay.height = 480
     overlay.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;object-fit:cover;z-index:1;pointer-events:none;background:#000'
     stage.appendChild(overlay)
-    // 保证我们这层在页面 video 之上、在结果卡片/HUD 之下
     var hud = stage.querySelectorAll('.hud, .hud-top, .hud-bottom')
     for (var i = 0; i < hud.length; i++) hud[i].style.zIndex = '3'
     return overlay
   }
 
   // ---------------- 取帧 ----------------
-  var polling = false
+  var polling = false, pollToken = 0
+  function stopPolling() { pollToken++; polling = false }
+
+  function drawFrame(bmp, device) {
+    if (canvas.width !== bmp.width) { canvas.width = bmp.width; canvas.height = bmp.height }
+    ctx.drawImage(bmp, 0, 0)
+    var view = ensureOverlay()
+    if (view) {
+      if (view.width !== bmp.width) { view.width = bmp.width; view.height = bmp.height }
+      view.getContext('2d').drawImage(bmp, 0, 0)
+    }
+    STATE.frames++
+  }
+
   function startPolling(base, device) {
-    if (polling) return
+    stopPolling()
     polling = true
+    var token = pollToken
     ensureCanvas()
-    var last = performance.now(), count = 0, url = base + '/capture?t='
+    STATE.fails = 0
+    var last = performance.now(), count = 0
+    var url = base + '/capture?t='
 
     function tick() {
+      if (token !== pollToken) return
       fetch(url + Date.now(), { cache: 'no-store', mode: 'cors' })
         .then(function (r) {
           if (!r.ok) throw new Error('HTTP ' + r.status)
@@ -144,15 +169,10 @@
         })
         .then(function (b) { return createImageBitmap(b) })
         .then(function (bmp) {
-          if (canvas.width !== bmp.width) { canvas.width = bmp.width; canvas.height = bmp.height }
-          ctx.drawImage(bmp, 0, 0)
-          var view = ensureOverlay()
-          if (view) {
-            if (view.width !== bmp.width) { view.width = bmp.width; view.height = bmp.height }
-            view.getContext('2d').drawImage(bmp, 0, 0)
-          }
+          STATE.fails = 0
+          drawFrame(bmp, device)
           if (bmp.close) bmp.close()
-          STATE.frames++; count++
+          count++
           var now = performance.now()
           if (now - last >= 1000) {
             STATE.fps = Math.round(count * 1000 / (now - last))
@@ -162,57 +182,146 @@
           }
         })
         .catch(function (e) {
-          STATE.lastError = String((e && e.message) || e)
-          setStatus(false, '取帧失败：' + STATE.lastError)
-          if (STATE.mode === 'direct' && _apiBase) { STATE.mode = 'proxy'; url = _apiBase + '/snapshot?t=' }
+          STATE.fails++
+          if (STATE.mode === 'direct' && _apiBase && STATE.fails === 1) {
+            STATE.mode = 'proxy'
+            url = _apiBase + '/snapshot?t='
+            setStatus(false, '直连失败，切换代理…')
+          } else {
+            setStatus(false, '取帧失败 ' + STATE.fails + ' 次：' + ((e && e.message) || e))
+          }
+          if (STATE.fails >= 5) {
+            // 连续失败：自动重新解析设备地址并重连
+            setStatus(false, '连接中断，正在自动重连…')
+            setTimeout(function () { autoConnect(false) }, 2000)
+            return
+          }
         })
-        .finally(function () { setTimeout(tick, 0) })
+        .finally(function () {
+          if (token === pollToken) setTimeout(tick, 0)
+        })
     }
     tick()
   }
 
   // ---------------- 连接 ----------------
-  function connect(device) {
-    var d = String(device || '').trim()
-    if (!d) { setStatus(false, '请先填写设备 IP'); return }
-    d = d.replace(/^https?:\/\//i, '').replace(/\/+$/, '')
-    STATE.device = d
-    saveDevice(d)
-    setStatus(false, '正在连接 ' + d + ' …')
-    STATE.mode = 'direct'
-
-    fetch('http://' + d + '/status', { cache: 'no-store', mode: 'cors' })
-      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json() })
-      .then(function (j) {
-        if (!j || !j.ok) throw new Error('设备未就绪')
-        STATE.mode = 'direct'
-        setStatus(false, '已直连 ' + d + '，开始取画面…')
-        startPolling('http://' + d, d)
-      })
-      .catch(function () {
-        STATE.mode = 'proxy'
-        setStatus(false, '直连不通，改走后端代理…')
-        resolveApiBase().then(function (base) {
-          if (!base) { setStatus(false, '后端接口不可达（3000 端口没起来？）'); return }
-          fetch(base + '/status?device=' + encodeURIComponent(d), { cache: 'no-store' })
-            .then(function (r) { return r.json() })
-            .then(function (j) {
-              var data = (j && j.data) || {}
-              if (!data.ok) { setStatus(false, '连不上 ' + d + '：' + (data.error || '无响应')); return }
-              setStatus(false, '经代理连通 ' + d + '，开始取画面…')
-              startPolling(base, d)
-            })
+  var _backendDevice = ''
+  function fetchBackendDevice() {
+    return resolveApiBase().then(function (base) {
+      if (!base) return ''
+      return fetch(base + '/config', { cache: 'no-store' })
+        .then(function (r) { return r.json() })
+        .then(function (j) {
+          _backendDevice = (j && j.data && j.data.device) || ''
+          return _backendDevice
         })
+        .catch(function () { return '' })
+    })
+  }
+
+  function candidates() {
+    var list = []
+    function push(d) {
+      d = String(d || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '')
+      if (d && list.indexOf(d) < 0) list.push(d)
+    }
+    push(qs('esp32'))
+    push(_backendDevice)
+    push(readSaved())
+    push(DEFAULT_DEVICE)
+    return list
+  }
+
+  function probe(device) {
+    return fetch('http://' + device + '/status', { cache: 'no-store', mode: 'cors' })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json() })
+      .then(function (j) { return !!(j && j.ok) })
+      .catch(function () {
+        // 直连不通（跨域/网络），用后端代理探一次
+        if (!_apiBase) return false
+        return fetch(_apiBase + '/status?device=' + encodeURIComponent(device), { cache: 'no-store' })
+          .then(function (r) { return r.json() })
+          .then(function (j) { return !!(j && j.data && j.data.ok) })
+          .catch(function () { return false })
       })
   }
 
+  // 让后端扫一遍局域网，找出摄像头（应对 DHCP 换 IP）
+  function discoverDevices() {
+    return resolveApiBase().then(function (base) {
+      if (!base) return []
+      setStatus(false, '正在局域网内搜索摄像头…')
+      return fetch(base + '/discover', { cache: 'no-store' })
+        .then(function (r) { return r.json() })
+        .then(function (j) { return (j && j.data && j.data.found) || [] })
+        .catch(function () { return [] })
+    })
+  }
+
+  function tryList(list, i) {
+    if (i >= list.length) {
+      discoverDevices().then(function (found) {
+        if (found.length > 0) {
+          tryList(found, 0)
+        } else {
+          setStatus(false, '没找到摄像头：确认板子已上电、和电脑连同一个 Wi-Fi')
+        }
+      })
+      return
+    }
+    var d = list[i]
+    setStatus(false, '正在尝试 ' + d + ' …')
+    probe(d).then(function (ok) {
+      if (!ok) return tryList(list, i + 1)
+      STATE.device = d
+      saveDevice(d)
+      STATE.mode = 'direct'
+      setStatus(false, '已连接 ' + d + '，开始取画面…')
+      startPolling('http://' + d, d)
+    })
+  }
+
+  var lastAutoAt = 0, autoRunning = false
+  function autoConnect(force) {
+    var now = Date.now()
+    if (!force && (autoRunning || now - lastAutoAt < 8000)) return   // 节流，避免反复扫全网段
+    lastAutoAt = now
+    autoRunning = true
+    if (force) setStatus(false, '正在自动查找设备…')
+    fetchBackendDevice().then(function () {
+      tryList(candidates(), 0)
+    }).finally(function () {
+      // 给探测本身留点时间再释放锁
+      setTimeout(function () { autoRunning = false }, 3000)
+    })
+  }
+
+  // 手动指定设备
+  function connect(device) {
+    var d = String(device || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '')
+    if (!d) { setStatus(false, '请先填写设备 IP'); return }
+    STATE.device = d
+    saveDevice(d)
+    setStatus(false, '正在连接 ' + d + ' …')
+    probe(d).then(function (ok) {
+      if (!ok) { setStatus(false, '连不上 ' + d + '（确认板子已上电并与电脑同一 Wi-Fi）'); return }
+      STATE.mode = 'direct'
+      setStatus(false, '已连接 ' + d + '，开始取画面…')
+      startPolling('http://' + d, d)
+    })
+  }
+
   // ---------------- 伪装摄像头 ----------------
+  var forcePcCamera = (qs('camera') === 'pc')
+
   function install() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return
     var original = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
     navigator.mediaDevices.getUserMedia = function (constraints) {
       var wantsVideo = !constraints || constraints.video
-      if (!wantsVideo || !STATE.device) return original(constraints)
+      // 注意：不能因为"还没拿到设备地址"就放行给电脑摄像头。
+      // 页面一旦拿到电脑摄像头的流，之后就连不上板子了（要刷新才行）。
+      if (!wantsVideo || forcePcCamera) return original(constraints)
       ensureCanvas()
       try {
         return Promise.resolve(canvas.captureStream(15))
@@ -226,26 +335,44 @@
     return /realtime|recognize/.test(location.pathname + location.hash)
   }
 
-  function boot() {
-    if (!isCamPage()) return
-    if (qs('camera') === 'pc') { STATE.device = ''; return }
-    buildPanel()
-    if (!STATE.device) { setStatus(false, '未连接，填入设备局域网 IP'); return }
-    connect(STATE.device)
+  // 单页应用里"进入实时监测页"不会触发页面重载，所以要在路由变化时主动接上
+  var inCamPage = false
+  function syncRoute() {
+    if (qs('camera') === 'pc') return
+    var cam = isCamPage()
+    if (cam && !inCamPage) {
+      inCamPage = true
+      if (!panel) buildPanel()
+      if (STATE.ok && polling) return          // 已经在取流，不用重连
+      if (!STATE.device) STATE.device = qs('esp32') || readSaved()
+      autoConnect(false)
+    } else if (!cam && inCamPage) {
+      inCamPage = false
+      stopPolling()                            // 离开页面就停止取帧，省带宽
+    }
   }
 
   STATE.device = qs('esp32') || readSaved()
   ensureCanvas()
   install()
 
+  function startRouteWatch() {
+    syncRoute()
+    window.addEventListener('hashchange', syncRoute)
+    window.addEventListener('popstate', syncRoute)
+    // uni-app H5 内部路由不一定会抛 hashchange，兜底轮询
+    setInterval(syncRoute, 1200)
+  }
+
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot)
+    document.addEventListener('DOMContentLoaded', startRouteWatch)
   } else {
-    boot()
+    startRouteWatch()
   }
 
   window.__esp32cam = {
     connect: connect,
+    auto: autoConnect,
     state: STATE,
     useDesktopCamera: function () { STATE.device = ''; saveDevice(''); location.reload() }
   }
